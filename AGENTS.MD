@@ -1,0 +1,1 @@
+I am using this project to learn about embedded programming and microcontroller development. So whenever you implement something, explain the reasoning behind your implementation and teach me something useful.
