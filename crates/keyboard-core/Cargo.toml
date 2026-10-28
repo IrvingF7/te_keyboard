@@ -1,0 +1,5 @@
+[package]
+name = "keyboard-core"
+version.workspace = true
+edition.workspace = true
+

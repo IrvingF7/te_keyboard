@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.cargo.buildScripts.enable": false,
+    "rust-analyzer.check.overrideCommand": [
+        "cargo", "check", "-p", "keyboard-core", "-p", "xtask", "--message-format=json"
+    ]
+}

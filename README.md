@@ -1,195 +1,293 @@
-# T-Keyboard
+# T-Keyboard — Rust firmware
 
-One PlatformIO project, two independently flashed devices. Open **this folder**
-(`te_keyboard`) in VS Code with the PlatformIO IDE extension.
+Two independent Rust programs, built with Cargo and ESP-IDF:
 
-## ESP-NOW connection test
+- **T-Knob / ESP32-C6:** MT6701 encoder, TMC6300 motor, 24 haptic detents.
+- **T-Display-Bar / ESP32-S3:** ESP-NOW telemetry, LCD sleep/wake and backlight controls.
 
-Both test targets exchange ESP-NOW heartbeats on **Wi-Fi channel 1**, four times
-per second. No router, Wi-Fi password, or wiring between boards is needed.
-Each board still needs power. Both USB cables connected on 2026-10-26 support
-data; the knob was identified as ESP32-C6 and the bar as ESP32-S3 via esptool.
+The application, board adapters, tests, and build helper are Rust. ESP-IDF is
+Espressif's native SDK, linked through Rust bindings; there is no Arduino
+framework or dependency on either vendor reference checkout.
 
-Build and flash the two boards separately (upload replaces their firmware):
+## Build, upload, and monitor
 
-```sh
-pio run -e knob_test -e display_test
-pio run -e knob_test -t upload --upload-port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_40:4C:CA:5C:39:30-if00
-pio run -e display_test -t upload --upload-port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_80:B5:4E:C7:F3:DC-if00
-```
-
-These persistent Linux device paths identify the current boards even if their
-`ttyACM` numbers change. On other systems use `pio device list` to find the ports.
-If `pio` is unavailable, use `~/.platformio/penv/bin/pio`. Close serial monitors
-before uploading.
-
-The display's pre-upload first 1 MiB is saved as
-`backups/t-display-before-espnow-first-1MiB-20261026.bin`. This partial backup
-covers the flash regions overwritten by this test upload; it is not a full
-16 MiB device backup. The knob's original full-flash backup remains available
-as described below.
-
-The display shows:
-
-- `CONNECTED` in green after a fresh heartbeat makes a round trip between MCUs.
-  TX counts submitted packets; increasing RX and `CONNECTED` confirm the link.
-- The knob's angle, signed logical steps (24 per revolution), and BOOT button.
-- The age of the last received packet. After roughly two seconds without a
-  working round trip, the status changes to `DISCONNECTED`. Shown telemetry is
-  the last received value while disconnected.
-
-Turn the knob and watch the angle/steps change. Press its **BOOT board button**
-after startup to see `BOOT:DOWN`; the shaft itself is not a click switch. Unplug
-the knob's power to check disconnection, then reconnect it to check automatic
-recovery. `WAITING FOR PEER` means no valid peer packets have arrived yet;
-`RADIO ERROR` means initialization failed (see serial output).
-
-Both USB serial logs print `LINK CONNECTED` with counters once per second:
+From this directory:
 
 ```sh
-pio device monitor -e knob_test --port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_40:4C:CA:5C:39:30-if00
-pio device monitor -e display_test --port /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_80:B5:4E:C7:F3:DC-if00
+cargo test
+cargo knob build
+cargo display build
+cargo knob flash
+cargo display flash
+cargo knob monitor
+cargo display monitor
 ```
 
-Use separate terminals for simultaneous monitoring. Once programmed, USB is
-only needed for power/logging: a power-only cable can run the knob, but cannot
-flash it. There are no PC media-key commands or motor actuation in this test.
+Run monitors in separate terminals; close a board's monitor before flashing it.
+`flash` builds and uploads, then resets the board. Add `--monitor` to open its
+serial monitor immediately afterward, for example `cargo knob flash --monitor`.
+Uploading replaces that board's firmware. Let the knob align untouched for
+about one second after a reset.
 
-The shared 32-byte versioned packet and link code live in
-`include/esp_now_link.h`. Peers are fixed to the two boards' station MACs:
-knob `40:4C:CA:5C:39:30`, display `80:B5:4E:C7:F3:DC`. Change those constants if
-replacing a board. Packets are unencrypted for this bench test, with source MAC,
-role, version, and length checks. Boot session IDs prevent stale echoes from
-claiming a new connection. Wi-Fi callbacks only enqueue packets; the main loop
-handles sends, telemetry, logging, and drawing.
+The two aliases invoke a small host-side Rust helper (`tools/xtask`). It selects
+chip architecture, compiler, flash size, SDK settings and a persistent Linux
+USB path. USB IDs identify the boards even when their `ttyACM` numbers change:
 
-Hardware validation on 2026-10-26 passed on both boards: bidirectional round
-trips, disconnect detection while each peer was paused in download mode, and
-automatic reconnection after either peer rebooted. Serial evidence is saved in
-`backups/espnow-validation-20261026.txt`. Both PlatformIO builds passed, and the
-code-reviewer subagent reported no actionable findings.
+| Board | Target | Flash | USB serial ID |
+| --- | --- | --- | --- |
+| Knob | `riscv32imac-esp-espidf` | 4 MiB | `40:4C:CA:5C:39:30` |
+| Display | `xtensa-esp32s3-espidf` | 16 MiB | `80:B5:4E:C7:F3:DC` |
 
-## Knob encoder diagnostics
-
-Connect only the T-Knob using a USB data cable. In the PlatformIO terminal:
+Override a port when needed, including on Windows/macOS:
 
 ```sh
-pio run -e knob_test
-pio device list
-pio run -e knob_test -t upload --upload-port /dev/ttyACM0
-pio device monitor -e knob_test --port /dev/ttyACM0
+KNOB_PORT=/dev/ttyACM2 cargo knob flash
+DISPLAY_PORT=/dev/ttyACM1 cargo display monitor
+cargo espflash list-ports
 ```
 
-Replace `/dev/ttyACM0` with the knob's actual port (Windows: `COMx`; macOS:
-`/dev/cu.usbmodem...`). If `pio` is missing from your shell, use PlatformIO's
-terminal or `~/.platformio/penv/bin/pio`. The first build downloads the toolchain.
-In VS Code, the same operations are under **PlatformIO > Project Tasks >
-knob_test > Build / Upload / Monitor**. Close the monitor before uploading again.
+These environment variables are the supported way to override the helper's
+port. Additional arguments are forwarded to Cargo or cargo-espflash.
 
-Uploading replaces the existing firmware. The checked-out vendor examples remain
-available for rebuilding motor demos later.
+## Install on a new development computer
 
-The connected knob's original 4 MB flash was saved to
-`backups/t-knob-original.bin` before loading this test. Keep that ignored backup
-if you want to restore its previous firmware. From this directory, using the
-PlatformIO Python environment with esptool installed:
+Install Rust using rustup, plus the system prerequisites in the
+[Rust ESP-IDF template](https://github.com/esp-rs/esp-idf-template). On Linux,
+these include a C compiler, CMake/Ninja, Python with venv support, pkg-config,
+and the normal development headers required by the tools below.
+
+The tested tool versions are:
 
 ```sh
-~/.platformio/penv/bin/python -m esptool --chip esp32c6 --port /dev/ttyACM0 write_flash 0x0 backups/t-knob-original.bin
+cargo install espup --version 0.19.0 --locked
+cargo install cargo-espflash --version 4.6.0 --locked
+cargo install ldproxy --version 0.3.5 --locked
+rustup toolchain install nightly-2026-04-15 --component rust-src --profile minimal
+espup install --targets esp32s3 --toolchain-version 1.95.0.0
 ```
 
-Use the same knob and its current port for restoration.
+The first firmware build downloads ESP-IDF **v5.3.2** and its native tools.
+Dependencies are recorded in `Cargo.lock`; board commands use `--locked`.
+The host tools require Rust 1.95 or newer. C6 uses the pinned RISC-V nightly;
+S3 uses the `esp` Xtensa compiler installed above. ESP-IDF supplies the runtime
+and FreeRTOS underneath Rust's standard library. No desktop OS runs on the MCU.
 
-Turn the knob by hand. Output shows absolute angle (0–360 degrees), relative
-movement since startup, signed logical steps (24 per revolution), and valid/error
-read counts. A status line appears every second even at rest. Angle wraps at one
-revolution; relative movement and steps continue across the boundary. The sign
-follows the encoder; map it to volume up/down after checking your preferred
-direction. Press/release **BOOT** after startup to see button events; this tests
-the board button, not a promised shaft-click switch.
+`espup` writes `~/export-esp.sh`. Our helper reads its `LIBCLANG_PATH` value for
+binding generation. If using a custom export location, source that file before
+building. The helper generates board-specific SDK defaults beneath `target/`,
+including an absolute path to `partitions.csv`. The common defaults are in
+`sdkconfig.defaults`. A 3 MiB application partition fits either board; the bar's
+additional flash and PSRAM are not needed by this firmware.
 
-The test holds all motor driver inputs LOW. The knob should turn freely: this
-tests the MT6701 encoder and USB, **not motor actuation or haptic detents**.
-`steps` are software counts. A growing `ok` count with few/no `errors` is expected;
-continuous errors or a fixed angle while turning require checking the hardware.
-After a long gap in valid data, movement across that gap can be ambiguous; this
-is a bench test, not a calibrated position controller.
+## Controls
 
-If upload cannot connect, hold BOOT, tap RESET, release BOOT, then retry. If the
-upload succeeds but output is absent, tap RESET and reopen the monitor at 115200.
-For Linux permission errors, configure serial access for your user and log in
-again; avoid running PlatformIO as root.
+| Board / button | Action | Serial shortcut |
+| --- | --- | --- |
+| Knob BOOT, GPIO 9 | Toggle haptics | `m` |
+| Bar BOOT, GPIO 0 | LCD sleep/wake | `d` |
+| Bar Button1, GPIO 38 | Backlight off/on | `b` |
+| Bar serial | Report panel and backlight state | `?` |
 
-## Layout
+Press BOOT after startup. Holding it during reset selects download mode.
+Buttons require 30 ms of stable input and trigger once per press. Defaults are
+haptics, LCD and backlight ON; these preferences are kept in RAM only.
+
+Backlight off leaves the LCD controller running but removes the light that
+makes its image visible. LCD sleep also stops drawing and sends display-off /
+sleep-in commands. The MCU, radio, USB and buttons remain awake. Wake waits
+120 ms without blocking the loop, redraws, then restores the saved backlight
+preference. Toggling backlight while asleep changes that preference only.
+
+These controls let us compare power modes; they do not measure USB current.
+Brightness dimming and automatic idle sleep have not been added.
+
+## How the Rust code is organized
 
 ```text
-te_keyboard/
-  platformio.ini             # Separate targets/toolchains for the C6 and S3
-  firmware/
-    knob/                   # Encoder + ESP-NOW link test; motor disabled
-    display/                # ESP-NOW status + live knob telemetry on screen
-  include/esp_now_link.h     # Shared packet, fixed peers, heartbeat/echo test
-  T-Knob/                   # Existing LILYGO reference checkout
-  T-Display-Bar/            # Existing LILYGO reference checkout + patched TFT
+Cargo.toml / Cargo.lock      workspace and dependency versions
+.cargo/config.toml          board aliases and compiler/linker configuration
+crates/keyboard-core/       portable logic and PC unit tests
+  src/controls.rs           debouncing and LCD power state machine
+  src/motor.rs              detents, encoder CRC, alignment math
+  src/protocol.rs           explicit packet encoding and link state
+crates/board-support/       USB, SPI and ESP-NOW adapters for ESP-IDF
+firmware/knob/src/          encoder, motor driver, haptic task, main loop
+firmware/display/src/       Rust framebuffer/panel driver and main loop
+tools/xtask/                PC-side Rust build/upload command helper
+T-Knob/                    ignored vendor hardware reference
+T-Display-Bar/             ignored vendor hardware reference
+backups/                   ignored recovery images and hardware logs
 ```
 
-The reference checkouts remain in place. The display target uses the vendor's
-custom board definition and local TFT_eSPI fork, including its 76 x 284 panel
-offsets. Keep both checkouts next to `platformio.ini`. The knob uses a pinned
-pioarduino 53.03.13 platform with Arduino 3.1.3 for ESP32-C6 support; the display stays on
-the vendor's PlatformIO espressif32 6.5.0 / Arduino 2.0.14 stack for compatibility.
-The generic C6 board profile is overridden to match the T-Knob's **4 MB flash**.
+Start learning in `keyboard-core`, which uses no ESP-IDF APIs. An `enum` models
+mutually exclusive states; `match` handles each state explicitly; `Option`
+represents a reading/packet that may be absent. `Result` propagates hardware
+errors with `?`. Comments explain why choices are made, not just syntax.
 
-This directory is not currently a Git repository. For version control, make the
-application the top-level repository and record the two vendor repositories as
-submodules at their current commits, preserving any local changes first.
+The knob's motor task owns the encoder and PWM driver. `Arc` shares a command
+flag and telemetry storage with the UI; `AtomicBool` carries on/off requests.
+The motor uses `try_lock` to publish a complete snapshot, so it never waits for
+a slow USB logger. Only the UI formats text and sends radio packets.
 
-## Display upload by port number
+ESP-IDF APIs that Rust cannot verify use small `unsafe` sections. In particular,
+SPI transaction memory must remain alive until completion, and the motor timer
+interrupt shares state through an ISR-safe critical section. Rust does not
+make incorrect pin maps, electrical settings or motor tuning safe automatically.
 
-Connect the bar, identify its port separately, then run:
+The editor recommendation is rust-analyzer. Default editor checks cover the
+portable core and host helper; board-specific checking uses the Cargo board
+commands because the two chips require different target architectures.
+
+## Haptics and timing
+
+The MT6701 returns a 14-bit angle plus status and CRC in a 24-bit SPI frame.
+Both bad checksums and field/tracking errors are rejected. SPI waits are bounded;
+a timed-out transaction is never reused or freed while hardware might own it.
+
+The control task runs approximately every 1 ms. At startup a fixed magnetic
+field ramps to a 1 V command over 250 ms. After a full 200 ms settling window
+and at least one second of alignment, that angle becomes detent zero. Slow
+continuous drift does not count as settling. Failure to settle within two
+seconds latches a fault.
+
+There are seven motor pole pairs and 24 detents per revolution. A proportional
+spring plus velocity damping pulls toward the current target. Crossing 55% of
+the 15-degree spacing selects the next target; this hysteresis prevents chatter.
+Normal commands are limited to ±0.8 V. This is voltage mode, not measured torque,
+a winding-current limit or a USB power cap. Near a stationary detent, the motor
+coasts when no correction is needed.
+
+Hardware MCPWM generates 20 kHz complementary pulses with 0.5 us dead time.
+An independent GPTimer interrupt checks every 1 ms and forces all six physical
+motor outputs LOW if an energized command becomes 20 ms old. Timeout is latched
+until reset; a subsequent task update cannot re-enable the motor. Encoder,
+driver, timing and alignment failures also latch faults.
+
+The watchdog is software running in an interrupt. Interrupt masking or flash
+cache operations can delay it; it is not an external hardware interlock. The
+application performs no flash writes during motor operation. Driver hardware
+protections remain in place. Serial logs report fault reason, encoder errors,
+maximum task interval and watchdog cutoff age.
+
+A deliberate 50 ms task-stall test is available as a separate build:
 
 ```sh
-pio run -e display_test
-pio run -e display_test -t upload --upload-port YOUR_BAR_PORT
-pio device monitor -e display_test --port YOUR_BAR_PORT
+cargo knob flash --features watchdog-self-test
+cargo knob monitor
+# After inspecting cutoff_us and the latched fault, restore normal firmware:
+cargo knob flash
 ```
 
-The screen shows the ESP-NOW link status and live knob readings described above.
+The normal build does not enable that feature.
 
-## System and next steps
+## ESP-NOW and display
 
-```text
-T-Knob (ESP32-C6) <-- ESP-NOW --> T-Display-Bar (ESP32-S3) <-- USB --> PC
- encoder + haptics                display + USB media keys          optional helper
+Both devices send four heartbeats per second on channel 1. No router is needed.
+The fixed peer addresses are in `protocol.rs`. USB supplies power and logs;
+haptics remain local even if the display disconnects.
+
+The 32-byte v1 packet is explicitly encoded little-endian, with a version,
+role, random boot session, sequence number, echoed session/sequence, angle,
+steps and flags. Rust never transmits its struct memory layout. Incoming
+packets must match the peer MAC, length, version and role. This is an
+unencrypted bench link; a MAC filter is not authentication.
+
+`CONNECTED` requires recent incoming packets AND a fresh echo of our own
+packets, proving a round trip. Connection expires after about two seconds.
+The last peer values remain visible when disconnected. Wi-Fi callbacks only
+validate/copy into a bounded inbox; UI and drawing happen in the main loop.
+
+The panel driver preserves the vendor register sequence and landscape RAM
+offset (18,82) for the 284×76 image. `embedded-graphics` renders text into a
+RGB565 framebuffer, then Rust sends it over SPI. It does not compile or link
+the vendor graphics library.
+
+The SPI bus uses the vendor's **mode 3**: clock idle HIGH, data sampled on the
+second edge. GPIO initialization also explicitly selects the GPIO pin function,
+not just input/output direction. Pins have multiple possible connections inside
+the chip; for example, LCD reset GPIO40 can instead serve JTAG MTDO. The Rust
+adapter uses `gpio_config()` to select GPIO routing before driving those pins.
+A successful SPI write confirms transmission, not a visible image on the LCD.
+
+PC media keys, OS-volume synchronization and animated pixel art are future
+features. The C6's USB is fixed-function serial/JTAG; the S3 can provide USB HID
+in a later USB-device implementation. The current USB interface is serial only.
+
+## Validation and recovery
+
+Run the portable checks with:
+
+```sh
+cargo test
+cargo clippy -p keyboard-core -p xtask -- -D warnings
+cargo fmt --all -- --check
+cargo knob build
+cargo display build
 ```
 
-Use the bar as the PC-facing controller. The C6's USB is fixed-function
-serial/JTAG and cannot implement a USB HID media keyboard. The S3 supports USB
-device/HID, so it can send volume up/down/mute commands without a PC helper.
-ESP-NOW is a practical first link between the two boards without extra wiring
-or a router; both must use the same Wi-Fi channel. If you prefer a wired link,
-UART is an alternative after verifying exposed, unused pins on both schematics.
-The USB-C ports do not directly connect these two boards as peers.
+Tests cover bounce, held buttons, timer wrap, rapid sleep/wake changes,
+backlight preferences, encoder CRC/status, angle wrap, both rotation directions,
+hysteresis, voltage limits, commutation direction, slow alignment drift, exact
+packet bytes, malformed packets, round trips, peer reboot and sequence wrap.
 
-The encoder, screen, and bidirectional ESP-NOW heartbeat test are implemented.
-Build the remaining pieces in this order:
+Both release firmware builds and all 10 host tests passed on 2026-10-27.
+Clippy passed with warnings denied for the portable core, host helper and both
+MCU targets. A follow-up code review identified incomplete GPIO initialization;
+the correction was reviewed with no remaining actionable findings.
 
-1. Extend the bench packet into an application protocol for controller state
-   and discrete button events. Current heartbeats carry cumulative steps and
-   button state; a brief press between packets can be missed.
-2. Add USB consumer-control HID on the bar for volume/mute. This needs an
-   application target with `ARDUINO_USB_MODE=0` (TinyUSB), rather than the hardware
-   CDC/JTAG mode used by the current screen test.
-3. Add a PC helper over USB CDC if the screen should show the **actual** system
-   volume, active app, track title, etc. HID volume keys alone do not report the
-   resulting OS volume back to the device. Choose the helper implementation for
-   your PC's operating system.
-4. Add motor control and haptic detents on the knob after the event path works.
-   Keep the fast motor-control loop separate from logging, radio and rendering.
+Both normal Rust firmwares were uploaded. Serial validation passed for the
+bidirectional link, haptics off/on, backlight off/on, LCD sleep/wake, changing
+backlight preference while asleep and restoring a dark preference on wake.
+During that run the largest motor-task interval was **1,506 us**, with zero
+encoder/send errors and no motor fault/cutoff. The separate 50 ms stall test
+recorded a **20,025 us** independent watchdog cutoff and latched the motor off.
+Normal firmware was restored afterward. Each board also detected the other
+being held in download mode and automatically reconnected after its restart.
+The final boot logs show no NVS initialization error. Logs:
+
+- `backups/rust-controls-validation-20261027.txt`
+- `backups/rust-watchdog-20261027.txt`
+- `backups/rust-reconnect-validation-20261027.txt`
+- `backups/rust-manual-observation-20261027.txt`
+- `backups/rust-gpio-controls-validation-20261027.txt`
+
+A subsequent read-only observation captured knob rotation and haptic button
+toggles without faults; its maximum task interval was 1,510 us.
+The user confirmed the knob works, but initially reported a white display.
+Correcting SPI mode alone did not restore the image. After switching the GPIO
+initialization to `gpio_config()`, the user confirmed visible, readable text.
+Both boards were reflashed with that shared GPIO correction. USB current still
+requires a meter; no oscilloscope measurement of the six motor outputs was
+performed.
+
+After the GPIO correction, the serial control sequence passed again with zero
+encoder/send errors, no motor fault, and a maximum motor-task interval of
+1,509 us. LCD sleep/wake and backlight preferences were exercised, and the
+test finished with haptics, LCD and backlight ON.
+
+Full pre-migration recovery images are saved for the exact connected boards:
+
+- `backups/knob-before-rust-20261027.bin` — 4 MiB.
+- `backups/display-before-rust-20261027.bin` — 16 MiB.
+- `backups/rust-recovery-manifest-20261027.json` — sizes and SHA-256 checksums.
+
+To restore a full image, close monitors and use the matching board's port:
+
+```sh
+cargo espflash write-bin --port YOUR_KNOB_PORT 0 backups/knob-before-rust-20261027.bin
+cargo espflash write-bin --port YOUR_DISPLAY_PORT 0 backups/display-before-rust-20261027.bin
+```
+
+Restoring writes the complete flash, including its previous partition table and
+stored data. Recovery backups are ignored by Git; preserve `backups/` separately.
+
+If a board does not enter download mode automatically, hold BOOT, tap RESET,
+release BOOT and retry. Flashing and monitoring use the same data cable.
 
 ## References
 
-- [LILYGO T-Knob](https://github.com/Xinyuan-LilyGO/T-Knob): pin map and MT6701 SPI/CRC reference.
-- [LILYGO T-Display-Bar](https://github.com/Xinyuan-LilyGO/T-Display-Bar): board definition and patched display library.
-- [ESP32-C6 USB limitations](https://docs.espressif.com/projects/esp-idf/en/stable/esp32c6/api-guides/usb-serial-jtag-console.html).
-- [Pinned pioarduino release](https://github.com/pioarduino/platform-espressif32/releases/tag/53.03.13).
+- [LILYGO T-Knob](https://github.com/Xinyuan-LilyGO/T-Knob)
+- [LILYGO T-Display-Bar](https://github.com/Xinyuan-LilyGO/T-Display-Bar)
+- [Rust ESP-IDF bindings](https://github.com/esp-rs/esp-idf)
+- [cargo-espflash](https://github.com/esp-rs/espflash/tree/main/cargo-espflash)
+- [Rust on ESP book](https://docs.espressif.com/projects/rust/book/)

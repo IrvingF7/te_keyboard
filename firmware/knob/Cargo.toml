@@ -1,0 +1,18 @@
+[package]
+name = "keyboard-knob"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Deliberate 50 ms stall for bench verification; never enabled in normal builds.
+watchdog-self-test = []
+
+[dependencies]
+anyhow.workspace = true
+esp-idf-svc.workspace = true
+keyboard-core.workspace = true
+board-support.workspace = true
+
+[build-dependencies]
+embuild.workspace = true
+
