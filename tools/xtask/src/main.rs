@@ -1,5 +1,6 @@
-//! A tiny PC-side Rust program gives us `cargo knob build/flash/monitor`.
+//! A tiny PC-side Rust program gives us `cargo knob build/flash/monitor/check/ide`.
 //! It selects the right CPU/toolchain and keeps USB identities out of firmware.
+mod editor;
 use std::{
     env, fs,
     path::PathBuf,
@@ -10,7 +11,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
     let board = args
         .first()
-        .ok_or("usage: cargo <knob|display> <build|flash|monitor> [extra args]")?;
+        .ok_or("usage: cargo <knob|display> <build|flash|monitor|check|ide> [extra args]")?;
     let action = args.get(1).map(String::as_str).unwrap_or("build");
     let (target, toolchain, serial, size) = match board.as_str() {
         "knob" => (
@@ -22,12 +23,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "display" => ("xtensa-esp32s3-espidf", "esp", "80:B5:4E:C7:F3:DC", "16MB"),
         _ => return Err("board must be knob or display".into()),
     };
-    if !["build", "flash", "monitor"].contains(&action) {
-        return Err("action must be build, flash or monitor".into());
+    if !["build", "flash", "monitor", "check", "ide", "ide-check"].contains(&action) {
+        return Err("action must be build, flash, monitor, check or ide".into());
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()?;
+    if action == "ide" {
+        return editor::configure(&root, board, target, toolchain);
+    }
     let generated = root.join("target").join(format!("{board}-config"));
     fs::create_dir_all(&generated)?;
     let defaults = generated.join("sdkconfig.defaults");
@@ -47,8 +51,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         cmd.arg(format!("+{toolchain}"));
         if action == "flash" {
             cmd.args(["espflash", "flash", "--port", &port]);
+        } else if action == "ide-check" {
+            cmd.args(["check", "--message-format=json"]);
         } else {
-            cmd.arg("build");
+            cmd.arg(action);
         }
         cmd.args([
             "--release",
@@ -61,6 +67,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     cmd.args(args.iter().skip(2));
     cmd.current_dir(&root)
+        // Only firmware commands need to rebuild std for ESP32. Keep that out
+        // of the workspace-wide settings used by host tools and editor probes.
+        .env("CARGO_UNSTABLE_BUILD_STD", "std,panic_abort")
         .env("ESP_IDF_SYS_ROOT_CRATE", format!("keyboard-{board}"))
         .env("ESP_IDF_SDKCONFIG_DEFAULTS", &defaults)
         .env("ESP_IDF_SDKCONFIG", generated.join("sdkconfig"));
@@ -77,8 +86,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    println!("{board}: {action} ({target})");
-    let status = cmd.status()?;
+    // Leave stdout for Cargo's JSON diagnostics when invoked by rust-analyzer.
+    eprintln!("{board}: {action} ({target})");
+    let status = if action == "ide-check" {
+        editor::check(&mut cmd, &root, target)?
+    } else {
+        cmd.status()?
+    };
     if !status.success() {
         return Err(format!("{action} failed: {status}").into());
     }

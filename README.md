@@ -15,6 +15,8 @@ From this directory:
 
 ```sh
 cargo test
+cargo knob check
+cargo display check
 cargo knob build
 cargo display build
 cargo knob flash
@@ -48,6 +50,14 @@ cargo espflash list-ports
 
 These environment variables are the supported way to override the helper's
 port. Additional arguments are forwarded to Cargo or cargo-espflash.
+`check` checks the firmware without producing a linked executable or uploading.
+
+`xtask` is a community convention for a project's own Rust development helper;
+it is an ordinary binary package. For example, `cargo knob build` expands to
+`cargo run --quiet -p xtask -- knob build`. The root `Cargo.toml` groups the
+packages in a workspace; each member's `Cargo.toml` declares that package's
+name, dependencies and features. Workspace dependency entries provide shared
+versions that members can explicitly inherit with `workspace = true`.
 
 ## Install on a new development computer
 
@@ -134,9 +144,39 @@ SPI transaction memory must remain alive until completion, and the motor timer
 interrupt shares state through an ISR-safe critical section. Rust does not
 make incorrect pin maps, electrical settings or motor tuning safe automatically.
 
-The editor recommendation is rust-analyzer. Default editor checks cover the
-portable core and host helper; board-specific checking uses the Cargo board
-commands because the two chips require different target architectures.
+The editor recommendation is rust-analyzer. Select the board you are editing:
+
+```sh
+cargo knob ide
+# Or switch to the display:
+cargo display ide
+```
+
+These commands update `.vscode/settings.json`, preserving unrelated settings.
+The committed default is the knob. VS Code should restart rust-analyzer when
+the configuration changes; if it does not, run **rust-analyzer: Restart server**
+from the Command Palette. Open this repository folder directly in VS Code so
+its folder settings apply.
+
+One board is analyzed at a time: shared libraries remain included, while the
+other board's firmware folder is excluded until you switch. This keeps C6 and
+S3 hardware definitions from being interpreted using the wrong chip settings.
+The editor loads build-script outputs and checks the selected firmware on save
+using the same helper as the terminal. Run `cargo test` for host unit tests and
+`cargo clippy -p keyboard-core -p xtask -- -D warnings` for host-tool checking.
+
+Both the initial build-data command and the check-on-save command must select
+the correct board. Configuring only check-on-save can leave rust-analyzer trying
+to build ESP-IDF for `x86_64-unknown-linux-gnu`. The helper also removes Cargo
+artifact bookkeeping for crates outside the editor's target metadata, while
+preserving all compiler diagnostics and failed exit statuses. Standard-library
+rebuilding is scoped to firmware commands rather than every Cargo invocation.
+
+The display's older `esp` Cargo lacks a metadata flag used by this rust-analyzer
+version. Its editor configuration uses stable Cargo for metadata, with the
+actual `esp` standard library and macro server selected explicitly. Firmware
+compilation continues to use the `esp` compiler. Re-run `cargo display ide`
+after moving or reinstalling that toolchain to refresh the generated paths.
 
 ## Haptics and timing
 
