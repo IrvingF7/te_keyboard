@@ -3,7 +3,8 @@
 Two independent Rust programs, built with Cargo and ESP-IDF:
 
 - **T-Knob / ESP32-C6:** MT6701 encoder, TMC6300 motor, 24 haptic detents.
-- **T-Display-Bar / ESP32-S3:** ESP-NOW telemetry, LCD sleep/wake and backlight controls.
+- **T-Display-Bar / ESP32-S3:** USB HID volume controls, ESP-NOW telemetry,
+  LCD sleep/wake and backlight controls.
 
 The application, board adapters, tests, and build helper are Rust. ESP-IDF is
 Espressif's native SDK, linked through Rust bindings; there is no Arduino
@@ -31,25 +32,44 @@ serial monitor immediately afterward, for example `cargo knob flash --monitor`.
 Uploading replaces that board's firmware. Let the knob align untouched for
 about one second after a reset.
 
+Once the display runs HID firmware, its normal USB port is a composite HID + CDC
+serial device. To flash it again, hold the display's BOOT button, tap RESET (or
+reconnect its USB cable while holding BOOT), then release BOOT. This exposes the
+ROM download port used by `cargo display flash`. The helper uses the runtime CDC
+port for `cargo display monitor` and switches to it after `cargo display flash
+--monitor`. Display commands in this plain serial terminal require Enter; Ctrl+C
+exits. `--non-interactive` disables keyboard input. The terminal does not reset
+the display or perform a ROM bootloader handshake.
+
 The two aliases invoke a small host-side Rust helper (`tools/xtask`). It selects
 chip architecture, compiler, flash size, SDK settings and a persistent Linux
-USB path. USB IDs identify the boards even when their `ttyACM` numbers change:
+USB path. These ROM download IDs identify the boards even when their `ttyACM`
+numbers change:
 
 | Board | Target | Flash | USB serial ID |
 | --- | --- | --- | --- |
 | Knob | `riscv32imac-esp-espidf` | 4 MiB | `40:4C:CA:5C:39:30` |
 | Display | `xtensa-esp32s3-espidf` | 16 MiB | `80:B5:4E:C7:F3:DC` |
 
+The display's runtime CDC interface is named `T-Keyboard Volume Display`, with
+its chip MAC as serial number (`80B54EC7F3DC` on this board). Its default Linux
+path is `/dev/serial/by-id/usb-T-Keyboard_Volume_Display_80B54EC7F3DC-if00`.
+
 Override a port when needed, including on Windows/macOS:
 
 ```sh
 KNOB_PORT=/dev/ttyACM2 cargo knob flash
 DISPLAY_PORT=/dev/ttyACM1 cargo display monitor
+DISPLAY_MONITOR_PORT=/dev/ttyACM1 cargo display flash --monitor
 cargo espflash list-ports
 ```
 
-These environment variables are the supported way to override the helper's
-port. Additional arguments are forwarded to Cargo or cargo-espflash.
+`DISPLAY_PORT` selects a port for the current action. `DISPLAY_MONITOR_PORT`
+overrides just the runtime monitor port, including after an upload; ROM and
+runtime devices can receive different COM/tty names. The corresponding
+`KNOB_PORT` / `KNOB_MONITOR_PORT` overrides also work. Build/upload arguments are
+forwarded to Cargo or cargo-espflash. The display's raw monitor accepts only
+`--non-interactive`; it does not support espflash's ROM monitor options.
 `check` checks the firmware without producing a linked executable or uploading.
 
 `xtask` is a community convention for a project's own Rust development helper;
@@ -77,7 +97,9 @@ espup install --targets esp32s3 --toolchain-version 1.95.0.0
 ```
 
 The first firmware build downloads ESP-IDF **v5.3.2** and its native tools.
-Dependencies are recorded in `Cargo.lock`; board commands use `--locked`.
+Rust dependencies are recorded in `Cargo.lock`; board commands use `--locked`.
+The display also downloads Espressif's `esp_tinyusb` 1.7.6 component. Native USB
+dependency versions and hashes are recorded in `components_esp32s3.lock`.
 The host tools require Rust 1.95 or newer. C6 uses the pinned RISC-V nightly;
 S3 uses the `esp` Xtensa compiler installed above. ESP-IDF supplies the runtime
 and FreeRTOS underneath Rust's standard library. No desktop OS runs on the MCU.
@@ -85,8 +107,9 @@ and FreeRTOS underneath Rust's standard library. No desktop OS runs on the MCU.
 `espup` writes `~/export-esp.sh`. Our helper reads its `LIBCLANG_PATH` value for
 binding generation. If using a custom export location, source that file before
 building. The helper generates board-specific SDK defaults beneath `target/`,
-including an absolute path to `partitions.csv`. The common defaults are in
-`sdkconfig.defaults`. A 3 MiB application partition fits either board; the bar's
+including an absolute path to `partitions.csv`. Common defaults are in
+`sdkconfig.defaults`, with USB settings in each firmware's `sdkconfig.defaults`.
+A 3 MiB application partition fits either board; the bar's
 additional flash and PSRAM are not needed by this firmware.
 
 ## Controls
@@ -120,7 +143,10 @@ crates/keyboard-core/       portable logic and PC unit tests
   src/controls.rs           debouncing and LCD power state machine
   src/motor.rs              detents, encoder CRC, alignment math
   src/protocol.rs           explicit packet encoding and link state
+  src/volume.rs             step tracking and HID press/release sequencing
+  src/usb.rs                composite USB and HID report descriptors
 crates/board-support/       USB, SPI and ESP-NOW adapters for ESP-IDF
+  src/usb.rs                S3 HID/CDC adapter and TinyUSB callbacks
 firmware/knob/src/          encoder, motor driver, haptic task, main loop
 firmware/display/src/       Rust framebuffer/panel driver and main loop
 tools/xtask/                PC-side Rust build/upload command helper
@@ -222,9 +248,10 @@ The normal build does not enable that feature.
 
 ## ESP-NOW and display
 
-Both devices send four heartbeats per second on channel 1. No router is needed.
-The fixed peer addresses are in `protocol.rs`. USB supplies power and logs;
-haptics remain local even if the display disconnects.
+Both devices send four heartbeats per second on channel 1. Knob step/flag changes
+also trigger packets, limited to one every 20 ms. No router is needed. The fixed
+peer addresses are in `protocol.rs`. USB supplies power and logs, and the display
+sends host volume keys; haptics remain local even if the display disconnects.
 
 The 32-byte v1 packet is explicitly encoded little-endian, with a version,
 role, random boot session, sequence number, echoed session/sequence, angle,
@@ -249,9 +276,55 @@ the chip; for example, LCD reset GPIO40 can instead serve JTAG MTDO. The Rust
 adapter uses `gpio_config()` to select GPIO routing before driving those pins.
 A successful SPI write confirms transmission, not a visible image on the LCD.
 
-PC media keys, OS-volume synchronization and animated pixel art are future
-features. The C6's USB is fixed-function serial/JTAG; the S3 can provide USB HID
-in a later USB-device implementation. The current USB interface is serial only.
+## Plug-and-play volume control
+
+Connect the display's USB port to the computer and power the knob. After encoder
+alignment and radio connection, positive knob steps generate **Volume Up** and
+negative steps generate **Volume Down**, one key press/release per step. These
+are standard USB HID Consumer Control events; no project-specific PC program is
+needed. Windows and the standard Ubuntu desktop handle them as multimedia
+keyboard volume keys. The desktop determines the volume increment and output
+device. Physical clockwise/counterclockwise direction still needs bench
+confirmation against the encoder's sign.
+
+The display remains a CDC serial device for `d`, `b`, `?`, and periodic status
+logs. Logs are best-effort and nonblocking: a closed or slow terminal cannot
+stall volume control. BOOT, LCD sleep, and backlight controls retain their
+previous functions. The C6 continues to use its existing Serial/JTAG port.
+
+```text
+knob cumulative steps -> ESP-NOW -> display -> VolumeSteps -> VolumeKeys
+                                                        -> HID press/release
+```
+
+`VolumeSteps` establishes a baseline on the first reading or a new boot session.
+`VolumeKeys` pairs each press with a release and retries when USB is busy. The
+display discards pending steps and waits for a fresh radio baseline after USB
+disconnect/suspend, radio loss, invalid encoder data, or a motor fault. A release
+still takes priority when input disappears. Pending movement is bounded to 32
+net steps and expires after 500 ms without new movement, so a slow host cannot
+replay an arbitrarily large, stale burst. Radio input older than 500 ms is ignored.
+
+HID reports are submitted from TinyUSB's task, which also handles connection
+changes. A one-report mailbox provides backpressure until each transfer finishes.
+If the display loop exits on a hardware error, USB disconnects to clear any held
+media key at the host.
+
+The USB descriptors are in `crates/keyboard-core/src/usb.rs`: one CDC function and
+one non-boot Consumer Control HID interface. The S3 uses Espressif's development
+VID and TinyUSB's CDC+HID PID. `firmware/display/usb_bindings.h` provides an opaque,
+size-preserving binding for an unused CDC telephony type that otherwise triggers
+Rust E0588 with the pinned ESP-IDF bindings generator. Application logic stays in
+Rust; the native USB stack is Espressif/TinyUSB.
+
+Current-volume feedback and animated pixel art remain future features. The LCD
+continues to show link and knob telemetry; it does not estimate volume percentage.
+
+After flashing, start with a low host volume and turn a few detents in each
+direction. Confirm desktop volume changes, then test unplug/replug, host
+suspend/resume, and knob restart for unexpected changes. Verify CDC commands
+and LCD sleep while turning. Repeat on Windows before treating cross-platform
+behavior as tested. Builds and portable checks do not replace these bench tests.
 
 ## Validation and recovery
 
@@ -259,6 +332,7 @@ Run the portable checks with:
 
 ```sh
 cargo test
+cargo test -p xtask
 cargo clippy -p keyboard-core -p xtask -- -D warnings
 cargo fmt --all -- --check
 cargo knob build
@@ -269,6 +343,22 @@ Tests cover bounce, held buttons, timer wrap, rapid sleep/wake changes,
 backlight preferences, encoder CRC/status, angle wrap, both rotation directions,
 hysteresis, voltage limits, commutation direction, slow alignment drift, exact
 packet bytes, malformed packets, round trips, peer reboot and sequence wrap.
+Volume tests also cover baseline resets, count rollover, press/release pairing,
+USB backpressure, stale backlog, reversal, composite descriptors, and prompt
+rate-limited knob updates. Helper tests cover ROM/runtime port selection and
+runtime-monitor argument handling.
+
+On 2026-10-29, the HID integration passed 20 core tests and 2 helper tests,
+portable/helper Clippy with warnings denied, formatting, and both release
+firmware builds. The required code review finished with no remaining findings.
+Both boards were then flashed. Ubuntu enumerated the display as `303a:4005`
+(`T-Keyboard Volume Display`), with CDC and a Consumer Control interface bound
+to `hid-generic`. Runtime CDC logs reported `USB READY LINK CONNECTED`, zero
+radio errors, and motor/panel/backlight ON. The flashing helper now passes
+`-Z build-std=std,panic_abort` explicitly because cargo-espflash's Xtensa
+preflight does not inspect the build-std environment variable.
+Physical volume changes, rotation direction, reconnect/suspend behavior, and
+Windows operation still await bench testing. The older results below predate HID.
 
 Both release firmware builds and all 10 host tests passed on 2026-10-27.
 Clippy passed with warnings denied for the portable core, host helper and both

@@ -94,6 +94,8 @@ pub struct LinkState {
     sequence: u32,
     last_echo: u32,
     last_send: u32,
+    last_steps: i32,
+    last_flags: u8,
     last_receive: u32,
     last_round_trip: Option<u32>,
     pub remote: Option<Packet>,
@@ -108,6 +110,8 @@ impl LinkState {
             sequence: 0,
             last_echo: 0,
             last_send: 0,
+            last_steps: 0,
+            last_flags: 0,
             last_receive: 0,
             last_round_trip: None,
             remote: None,
@@ -140,10 +144,17 @@ impl LinkState {
         }
     }
     pub fn outgoing(&mut self, now: u32, angle: u16, steps: i32, flags: u8) -> Option<Packet> {
-        if now.wrapping_sub(self.last_send) < 250 {
+        let elapsed = now.wrapping_sub(self.last_send);
+        let changed =
+            self.role == Role::Knob && (steps != self.last_steps || flags != self.last_flags);
+        // Keep idle heartbeats at 4 Hz, but deliver turns within 20 ms instead
+        // of waiting for the next heartbeat. Packets remain cumulative v1.
+        if elapsed < 20 || (!changed && elapsed < 250) {
             return None;
         }
         self.last_send = now;
+        self.last_steps = steps;
+        self.last_flags = flags;
         self.sequence = self.sequence.wrapping_add(1).max(1);
         Some(Packet {
             role: self.role,
@@ -248,5 +259,20 @@ mod tests {
         assert_eq!(l.outgoing(149, 0, 0, 0).unwrap().sequence, 1);
         assert!(newer(1, u32::MAX));
         assert!(!newer(u32::MAX, 1));
+    }
+
+    #[test]
+    fn knob_changes_are_prompt_bounded_and_repeated_by_heartbeats() {
+        let mut knob = LinkState::new(Role::Knob, 1);
+        assert!(knob.outgoing(19, 0, 1, ENCODER_VALID).is_none());
+        assert_eq!(knob.outgoing(20, 0, 1, ENCODER_VALID).unwrap().steps, 1);
+        assert!(knob.outgoing(21, 0, 2, ENCODER_VALID).is_none());
+        assert_eq!(knob.outgoing(40, 0, 3, ENCODER_VALID).unwrap().steps, 3);
+        assert!(knob.outgoing(289, 0, 3, ENCODER_VALID).is_none());
+        assert_eq!(knob.outgoing(290, 0, 3, ENCODER_VALID).unwrap().steps, 3);
+        // Display heartbeats retain their 250 ms cadence.
+        let mut display = LinkState::new(Role::Display, 2);
+        assert!(display.outgoing(20, 0, 1, 1).is_none());
+        assert!(display.outgoing(250, 0, 1, 1).is_some());
     }
 }

@@ -7,9 +7,13 @@ edition.workspace = true
 anyhow.workspace = true
 esp-idf-svc.workspace = true
 keyboard-core.workspace = true
-board-support.workspace = true
+board-support = { workspace = true, features = ["usb-device"] }
 embedded-graphics = "=0.8.1"
 
 [build-dependencies]
 embuild.workspace = true
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_tinyusb", version = "=1.7.6" }
+bindings_header = "usb_bindings.h"
 

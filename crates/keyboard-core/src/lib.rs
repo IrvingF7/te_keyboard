@@ -2,3 +2,5 @@
 pub mod controls;
 pub mod motor;
 pub mod protocol;
+pub mod usb;
+pub mod volume;

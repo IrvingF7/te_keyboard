@@ -2,6 +2,8 @@
 pub mod radio;
 pub mod serial;
 pub mod spi;
+#[cfg(feature = "usb-device")]
+pub mod usb;
 
 pub use esp_idf_svc::sys;
 
