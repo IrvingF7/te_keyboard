@@ -1,7 +1,9 @@
 //! A tiny PC-side Rust program gives us `cargo knob build/flash/monitor/check/ide`.
 //! It selects the right CPU/toolchain and keeps USB identities out of firmware.
+mod bootloader;
 mod editor;
 mod monitor;
+mod volume;
 use std::{
     env, fs,
     path::PathBuf,
@@ -34,7 +36,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = env::args().skip(1).collect();
     let board = args
         .first()
-        .ok_or("usage: cargo <knob|display> <build|flash|monitor|check|ide> [extra args]")?;
+        .ok_or("usage: cargo <knob|display> <build|flash|monitor|check|ide|volume> [extra args]")?;
     let action = args.get(1).map(String::as_str).unwrap_or("build");
     let (target, toolchain, serial, size) = match board.as_str() {
         "knob" => (
@@ -46,8 +48,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "display" => ("xtensa-esp32s3-espidf", "esp", "80:B5:4E:C7:F3:DC", "16MB"),
         _ => return Err("board must be knob or display".into()),
     };
-    if !["build", "flash", "monitor", "check", "ide", "ide-check"].contains(&action) {
-        return Err("action must be build, flash, monitor, check or ide".into());
+    if ![
+        "build",
+        "flash",
+        "monitor",
+        "check",
+        "ide",
+        "ide-check",
+        "volume",
+    ]
+    .contains(&action)
+    {
+        return Err(
+            "action must be build, flash, monitor, check, ide or volume (display only)".into(),
+        );
+    }
+    if action == "volume" {
+        if board != "display" {
+            return Err("volume feedback is available only with cargo display volume".into());
+        }
+        let once = volume::once(&args[2..])?;
+        return volume::run(&port_for(board, serial, true), once);
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -70,24 +91,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if fs::read_to_string(&defaults).ok().as_deref() != Some(&config) {
         fs::write(&defaults, config)?;
     }
-    let port = port_for(board, serial, action == "monitor");
-    // The S3's running HID firmware and ROM downloader enumerate separately.
-    // Let espflash upload via ROM, then open our CDC interface for --monitor.
+    // Asking cargo-espflash for help/version must never switch the display USB.
+    let informational = args
+        .iter()
+        .skip(2)
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"));
+    let port = if board == "display" && action == "flash" && !informational {
+        bootloader::prepare_flash(serial)?
+    } else {
+        port_for(board, serial, action == "monitor")
+    };
+    // The S3's running HID firmware and hardware downloader enumerate separately.
+    // Let espflash upload via Serial/JTAG, then open our CDC for --monitor.
     let monitor_after_flash = board == "display"
         && action == "flash"
+        && !informational
         && args
             .iter()
             .skip(2)
             .any(|arg| arg == "--monitor" || arg == "-M");
-    if board == "display"
-        && action == "flash"
-        && port.starts_with("/dev/")
-        && !std::path::Path::new(&port).exists()
-    {
-        return Err(format!(
-            "Display ROM download port is unavailable: {port}. Hold display BOOT, tap RESET (or reconnect its USB cable), then release BOOT and retry. Use DISPLAY_PORT to override the download port."
-        ).into());
-    }
     let mut cmd = Command::new("cargo");
     if action == "monitor" {
         cmd.args(["espflash", "monitor", "--port", &port]);

@@ -915,6 +915,14 @@ dependencies = [
  "embuild",
  "esp-idf-svc",
  "keyboard-core",
+ "keyboard-display-ui",
+]
+
+[[package]]
+name = "keyboard-display-ui"
+version = "0.1.0"
+dependencies = [
+ "embedded-graphics",
 ]
 
 [[package]]

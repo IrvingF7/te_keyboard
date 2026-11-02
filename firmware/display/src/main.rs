@@ -1,17 +1,13 @@
 mod panel;
 use board_support::{input_pullup, is_low, millis, radio::Radio, usb::UsbDevice};
-use embedded_graphics::{
-    mono_font::{ascii::FONT_8X13, MonoTextStyle},
-    pixelcolor::Rgb565,
-    prelude::*,
-    text::{Baseline, Text},
-};
 use esp_idf_svc::hal::peripherals::Peripherals;
 use keyboard_core::{
     controls::{Action, Button, PanelPower},
+    feedback::{ConsoleCommand, ConsoleInput, HostFeedback},
     protocol::*,
-    volume::VolumeKeys,
+    volume::{VolumeKeys, VOLUME_DOWN, VOLUME_UP},
 };
+use keyboard_display_ui::{Activity, Connection, VolumeDisplay};
 use panel::Panel;
 use std::{thread::sleep, time::Duration};
 
@@ -40,63 +36,8 @@ fn motor(flags: u8) -> &'static str {
         "OFF/ALIGN"
     }
 }
-fn draw(panel: &mut Panel, radio: &Radio, power: &PanelPower, now: u32) -> anyhow::Result<()> {
-    panel.frame.clear(Rgb565::BLACK)?;
-    let remote = radio.link.remote;
-    let lines = [
-        (
-            format!("ESP-NOW TX:{} RX:{}", radio.sent, radio.link.received),
-            Rgb565::CYAN,
-        ),
-        (
-            radio.link.status(now).to_owned(),
-            if radio.link.connected(now) {
-                Rgb565::GREEN
-            } else {
-                Rgb565::YELLOW
-            },
-        ),
-        (
-            remote.map_or_else(
-                || "Power on the knob to connect".to_owned(),
-                |p| {
-                    if p.flags & ENCODER_VALID != 0 {
-                        format!(
-                            "Angle:{:.1} Steps:{}",
-                            p.angle as f32 * 360.0 / 16384.0,
-                            p.steps
-                        )
-                    } else {
-                        "Encoder: waiting for valid data".to_owned()
-                    }
-                },
-            ),
-            Rgb565::WHITE,
-        ),
-        (
-            remote.map_or_else(
-                || "BOOT:LCD BTN38:backlight".to_owned(),
-                |p| {
-                    format!(
-                        "Motor:{} BL:{} RX:{}ms",
-                        motor(p.flags),
-                        on_off(power.backlight_on()),
-                        radio.link.age(now)
-                    )
-                },
-            ),
-            Rgb565::WHITE,
-        ),
-    ];
-    for (row, (text, color)) in lines.iter().enumerate() {
-        Text::with_baseline(
-            text,
-            Point::new(4, (row * 19) as i32),
-            MonoTextStyle::new(&FONT_8X13, *color),
-            Baseline::Top,
-        )
-        .draw(&mut panel.frame)?;
-    }
+fn draw(panel: &mut Panel, display: &VolumeDisplay) -> anyhow::Result<()> {
+    keyboard_display_ui::draw(&mut panel.frame, display)?;
     panel.flush()
 }
 fn run() -> anyhow::Result<()> {
@@ -106,6 +47,9 @@ fn run() -> anyhow::Result<()> {
     let mut usb_connection = 0;
     let mut last_packet = None;
     let mut input_active = false;
+    let mut console = ConsoleInput::default();
+    let mut feedback = HostFeedback::default();
+    let mut activity = None;
     input_pullup(0)?;
     input_pullup(38)?;
     let mut panel_button = Button::new(is_low(0), millis());
@@ -114,14 +58,26 @@ fn run() -> anyhow::Result<()> {
     let mut panel = Panel::new()?;
     let mut radio = Radio::new(peripherals.modem, Role::Display)?;
     usb.log(format_args!(
-        "T-Display-Bar: USB volume keys; BOOT/'d' LCD; GPIO38/'b' backlight; '?' state"
+        "T-Display-Bar: volume UI; d/b/? + Enter; optional host feedback: cargo display volume"
     ));
-    draw(&mut panel, &radio, &power, millis())?;
+    let mut last_frame = VolumeDisplay {
+        level: None,
+        muted: false,
+        connection: Connection::NoHost,
+        activity: Activity::Idle,
+    };
+    draw(&mut panel, &last_frame)?;
     panel.backlight(true)?;
     print_power(&mut usb, &power);
     let (mut last_draw, mut last_print) = (millis(), millis());
     loop {
         let now = millis();
+        let (connection, online) = usb.connection();
+        if connection != usb_connection || !online {
+            feedback.set(None, now);
+            console = ConsoleInput::default();
+            activity = None;
+        }
         let mut changed = false;
         if panel_button.update(is_low(0), now) {
             power.toggle_panel();
@@ -131,22 +87,32 @@ fn run() -> anyhow::Result<()> {
             power.toggle_backlight();
             changed = true;
         }
-        if let Some(command) = usb.read() {
+        // Drain a bounded burst: a whole snapshot fits in one tick, while a
+        // chatty host cannot starve the radio, HID releases, or panel buttons.
+        for _ in 0..64 {
+            let Some(byte) = usb.read() else { break };
+            let Some(command) = console.push(byte) else {
+                continue;
+            };
             match command {
-                b'd' => {
+                ConsoleCommand::TogglePanel => {
                     power.toggle_panel();
                     changed = true;
                 }
-                b'b' => {
+                ConsoleCommand::ToggleBacklight => {
                     power.toggle_backlight();
                     changed = true;
                 }
-                b'?' => print_power(&mut usb, &power),
-                _ => (),
+                ConsoleCommand::PowerStatus => print_power(&mut usb, &power),
+                ConsoleCommand::Bootloader => usb.enter_flash_mode(),
+                ConsoleCommand::Volume(value) => {
+                    if online {
+                        feedback.set(value, now);
+                    }
+                }
             }
         }
         radio.tick(now, 0, 0, 0);
-        let (connection, online) = usb.connection();
         let remote = radio.link.remote;
         let packet_id = remote.map(|p| (p.session, p.sequence));
         let valid = radio.link.connected(now)
@@ -155,6 +121,7 @@ fn run() -> anyhow::Result<()> {
         if connection != usb_connection || (input_active && (!online || !valid)) {
             volume.reset();
             usb.cancel_pending();
+            activity = None;
         }
         if connection != usb_connection || !online || !valid {
             // Wait for a NEW packet before establishing the next baseline.
@@ -164,6 +131,7 @@ fn run() -> anyhow::Result<()> {
             if let Some(packet) = remote {
                 if last_packet.is_some_and(|(session, _)| session != packet.session) {
                     usb.cancel_pending();
+                    activity = None;
                 }
                 volume.observe(packet.session, packet.steps, now);
             }
@@ -176,8 +144,34 @@ fn run() -> anyhow::Result<()> {
         if let Some(report) = volume.next_report(now) {
             if usb.send_report(connection, report) {
                 volume.report_sent(report);
+                match report {
+                    VOLUME_UP => activity = Some((Activity::Up, now)),
+                    VOLUME_DOWN => activity = Some((Activity::Down, now)),
+                    _ => (),
+                }
             }
         }
+        let host_volume = feedback.current(now);
+        let display = VolumeDisplay {
+            level: host_volume.map(|value| value.percent),
+            muted: host_volume.is_some_and(|value| value.muted),
+            connection: if !online {
+                Connection::NoHost
+            } else if radio.link.connected(now)
+                && radio.link.age(now) < 500
+                && remote.is_some_and(|packet| packet.flags & HAPTICS_FAULT != 0)
+            {
+                Connection::KnobFault
+            } else if !valid {
+                Connection::NoKnob
+            } else {
+                Connection::Ready
+            },
+            // This pulse acknowledges a queued key, not an inferred volume.
+            activity: activity
+                .filter(|(_, started)| now.wrapping_sub(*started) < 180)
+                .map_or(Activity::Idle, |(direction, _)| direction),
+        };
         let action = power.tick(now);
         match action {
             Action::Sleep => {
@@ -188,7 +182,9 @@ fn run() -> anyhow::Result<()> {
             Action::Wake => panel.command(0x11, &[])?,
             Action::Redraw => {
                 panel.command(0x29, &[])?;
-                draw(&mut panel, &radio, &power, now)?;
+                draw(&mut panel, &display)?;
+                last_frame = display;
+                last_draw = now;
             }
             Action::None => (),
         }
@@ -196,9 +192,12 @@ fn run() -> anyhow::Result<()> {
         if changed || action != Action::None {
             print_power(&mut usb, &power);
         }
-        if power.awake() && now.wrapping_sub(last_draw) >= 250 {
+        // A full frame costs ~9 ms on the wire. Only transfer changed images,
+        // capped at 25 Hz, keeping the input loop responsive when idle.
+        if power.awake() && display != last_frame && now.wrapping_sub(last_draw) >= 40 {
             last_draw = now;
-            draw(&mut panel, &radio, &power, now)?;
+            draw(&mut panel, &display)?;
+            last_frame = display;
         }
         if now.wrapping_sub(last_print) >= 1000 {
             last_print = now;

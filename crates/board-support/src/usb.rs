@@ -8,9 +8,13 @@ use std::{
         atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
         Mutex,
     },
+    thread::sleep,
+    time::Duration,
 };
 
 static TAKEN: AtomicBool = AtomicBool::new(false);
+// One-way transition: no mailbox accesses after TinyUSB's task is deleted.
+static FLASH_HANDOFF: AtomicBool = AtomicBool::new(false);
 // Bit 0 is online; the other bits change on every connection transition.
 static CONNECTION: AtomicU32 = AtomicU32::new(0);
 static CURRENT_REPORT: AtomicU16 = AtomicU16::new(0);
@@ -124,6 +128,37 @@ impl UsbDevice {
             *pending = None;
         }
     }
+
+    /// Return USB ownership to the hardware Serial/JTAG controller. espflash
+    /// then uses its normal DTR/RTS reset to enter ROM and start the new app.
+    /// Consuming this device prevents application USB calls after teardown.
+    pub fn enter_flash_mode(self) -> ! {
+        FLASH_HANDOFF.store(true, Ordering::Release);
+        // Drop detaches HID as well as CDC, clearing any held key at the host.
+        drop(self);
+        sleep(Duration::from_millis(150));
+
+        // The supported IDF APIs stop TinyUSB, release its PHY, and install the
+        // fixed-function controller (including clocks, PHY mux, and USB pads).
+        // No force-download flag is needed: that can trap an S3 in ROM after
+        // uploading. Let the hardware controller handle entry AND exit.
+        let stopped = unsafe { sys::tinyusb_driver_uninstall() } == sys::ESP_OK;
+        let mut config = sys::usb_serial_jtag_driver_config_t {
+            tx_buffer_size: 256,
+            rx_buffer_size: 256,
+        };
+        if !stopped || unsafe { sys::usb_serial_jtag_driver_install(&mut config) } != sys::ESP_OK {
+            // Recover the normal application if the handoff itself fails.
+            unsafe { sys::esp_restart() }
+        }
+
+        // Keep the hardware port available while Cargo builds. A firmware
+        // upload resets the MCU; RESET also restores the app if upload is
+        // abandoned. No TinyUSB or mailbox access is permitted from here.
+        loop {
+            sleep(Duration::from_millis(1000));
+        }
+    }
 }
 
 impl Drop for UsbDevice {
@@ -141,6 +176,12 @@ impl Drop for UsbDevice {
 }
 
 fn connection_changed(online: bool) {
+    // TinyUSB calls tud_umount_cb DURING teardown, after deleting its task.
+    // That task could have been holding this Rust mutex when deleted. Do not
+    // acquire it during the one-way handoff; all state is discarded on reset.
+    if FLASH_HANDOFF.load(Ordering::Acquire) {
+        return;
+    }
     let mut pending = PENDING_REPORT.lock().unwrap();
     *pending = None;
     let previous = CONNECTION.load(Ordering::Relaxed);
@@ -153,6 +194,9 @@ fn connection_changed(online: bool) {
 
 #[no_mangle]
 extern "C" fn tud_sof_cb(_frame_count: u32) {
+    if FLASH_HANDOFF.load(Ordering::Acquire) {
+        return;
+    }
     // Never wait for the UI while servicing USB events.
     let Ok(mut pending) = PENDING_REPORT.try_lock() else {
         return;
@@ -185,6 +229,9 @@ extern "C" fn tud_sof_cb(_frame_count: u32) {
 
 #[no_mangle]
 extern "C" fn tud_hid_report_complete_cb(_instance: u8, _report: *const u8, _len: u16) {
+    if FLASH_HANDOFF.load(Ordering::Acquire) {
+        return;
+    }
     let mut pending = PENDING_REPORT.lock().unwrap();
     if pending.as_ref().is_some_and(|report| report.submitted) {
         *pending = None;

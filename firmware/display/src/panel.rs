@@ -9,21 +9,20 @@ use embedded_graphics::{
 };
 use std::{convert::Infallible, thread::sleep, time::Duration};
 
-pub const WIDTH: usize = 284;
-pub const HEIGHT: usize = 76;
+use keyboard_display_ui::{HEIGHT, WIDTH};
 pub struct Frame {
     bytes: Vec<u8>,
 }
 impl Frame {
     fn new() -> Self {
         Self {
-            bytes: vec![0; WIDTH * HEIGHT * 2],
+            bytes: vec![0; (WIDTH * HEIGHT * 2) as usize],
         }
     }
 }
 impl OriginDimensions for Frame {
     fn size(&self) -> Size {
-        Size::new(WIDTH as u32, HEIGHT as u32)
+        Size::new(WIDTH, HEIGHT)
     }
 }
 impl DrawTarget for Frame {
@@ -35,7 +34,7 @@ impl DrawTarget for Frame {
     ) -> Result<(), Self::Error> {
         for Pixel(point, color) in pixels {
             if point.x >= 0 && point.y >= 0 && point.x < WIDTH as i32 && point.y < HEIGHT as i32 {
-                let index = (point.y as usize * WIDTH + point.x as usize) * 2;
+                let index = (point.y as usize * WIDTH as usize + point.x as usize) * 2;
                 self.bytes[index..index + 2].copy_from_slice(&color.into_storage().to_be_bytes());
             }
         }

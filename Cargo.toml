@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keyboard-core", "crates/board-support", "firmware/knob", "firmware/display", "tools/xtask"]
+members = ["crates/keyboard-core", "crates/board-support", "crates/display-ui", "firmware/knob", "firmware/display", "tools/xtask"]
 # `cargo test` runs on the PC. Firmware is cross-compiled using the board aliases.
 default-members = ["crates/keyboard-core"]
 
@@ -13,6 +13,7 @@ anyhow = "1"
 esp-idf-svc = "=0.51.0"
 embuild = "=0.33.1"
 keyboard-core = { path = "crates/keyboard-core" }
+keyboard-display-ui = { path = "crates/display-ui" }
 board-support = { path = "crates/board-support" }
 
 [profile.release]

@@ -4,7 +4,7 @@ Two independent Rust programs, built with Cargo and ESP-IDF:
 
 - **T-Knob / ESP32-C6:** MT6701 encoder, TMC6300 motor, 24 haptic detents.
 - **T-Display-Bar / ESP32-S3:** USB HID volume controls, ESP-NOW telemetry,
-  LCD sleep/wake and backlight controls.
+  volume instrument UI, LCD sleep/wake and backlight controls.
 
 The application, board adapters, tests, and build helper are Rust. ESP-IDF is
 Espressif's native SDK, linked through Rust bindings; there is no Arduino
@@ -33,18 +33,29 @@ Uploading replaces that board's firmware. Let the knob align untouched for
 about one second after a reset.
 
 Once the display runs HID firmware, its normal USB port is a composite HID + CDC
-serial device. To flash it again, hold the display's BOOT button, tap RESET (or
-reconnect its USB cable while holding BOOT), then release BOOT. This exposes the
-ROM download port used by `cargo display flash`. The helper uses the runtime CDC
-port for `cargo display monitor` and switches to it after `cargo display flash
---monitor`. Display commands in this plain serial terminal require Enter; Ctrl+C
-exits. `--non-interactive` disables keyboard input. The terminal does not reset
-the display or perform a ROM bootloader handshake.
+serial device. `cargo display flash` now requests a switch back to hardware
+USB Serial/JTAG, waits for that interface to appear, then lets espflash reset
+the chip into its ROM downloader and upload normally. It identifies the display
+by its USB identity and chip serial, so it does not select the adjacent knob.
+Close `cargo display monitor` or `cargo display volume` before flashing.
+
+**The first upload of firmware supporting this handoff still needs BOOT+RESET.**
+Hold the display's BOOT button, press and release its actual RESET button while
+holding BOOT, then release BOOT after a second. BLK is the backlight button,
+not RESET. Reconnecting USB may not reset a battery-powered board. The same
+manual sequence remains available when the application is unresponsive.
+If this manual upload leaves the board in download mode, release BOOT and tap
+RESET once to start the installed firmware.
+
+The helper uses the runtime CDC port for `cargo display monitor` and switches
+to it after `cargo display flash --monitor`. Display commands in this plain
+serial terminal require Enter; Ctrl+C exits. `--non-interactive` disables
+keyboard input. Opening a monitor or volume helper never requests the handoff.
 
 The two aliases invoke a small host-side Rust helper (`tools/xtask`). It selects
 chip architecture, compiler, flash size, SDK settings and a persistent Linux
-USB path. These ROM download IDs identify the boards even when their `ttyACM`
-numbers change:
+USB identity. These hardware Serial/JTAG IDs identify the boards even when
+their `ttyACM` numbers change:
 
 | Board | Target | Flash | USB serial ID |
 | --- | --- | --- | --- |
@@ -66,11 +77,27 @@ cargo espflash list-ports
 
 `DISPLAY_PORT` selects a port for the current action. `DISPLAY_MONITOR_PORT`
 overrides just the runtime monitor port, including after an upload; ROM and
-runtime devices can receive different COM/tty names. The corresponding
+runtime devices can receive different COM/tty names. For automatic display
+flashing, `DISPLAY_PORT` selects the hardware flashing destination and
+`DISPLAY_MONITOR_PORT` independently selects the runtime port used to request
+the handoff. Otherwise the flash command discovers these ports by USB identity.
+The corresponding
 `KNOB_PORT` / `KNOB_MONITOR_PORT` overrides also work. Build/upload arguments are
 forwarded to Cargo or cargo-espflash. The display's raw monitor accepts only
 `--non-interactive`; it does not support espflash's ROM monitor options.
 `check` checks the firmware without producing a linked executable or uploading.
+
+The automatic handoff reuses the existing `esp-idf-svc::sys` bindings and
+`serialport` crate. An exact `BOOTLOADER` line on CDC consumes the application's
+USB device, disconnects HID/CDC, and calls `tinyusb_driver_uninstall()` followed
+by `usb_serial_jtag_driver_install()`. The latter restores the fixed-function
+controller that supports [automatic download-mode reset](https://docs.espressif.com/projects/esp-idf/en/v5.3.2/esp32s3/api-guides/usb-serial-jtag-console.html).
+The host waits up to ten seconds for the matching hardware port, then invokes
+espflash. There is no replacement bootloader or forced boot-mode register flag.
+The application waits in this handoff state until espflash resets it. If an
+upload is cancelled or the build fails, tap RESET without holding BOOT to resume
+the existing firmware. Ordinary monitor opens and volume updates never switch
+USB modes. `cargo display flash --help` also leaves the device alone.
 
 `xtask` is a community convention for a project's own Rust development helper;
 it is an ordinary binary package. For example, `cargo knob build` expands to
@@ -141,15 +168,18 @@ Cargo.toml / Cargo.lock      workspace and dependency versions
 .cargo/config.toml          board aliases and compiler/linker configuration
 crates/keyboard-core/       portable logic and PC unit tests
   src/controls.rs           debouncing and LCD power state machine
+  src/feedback.rs           bounded CDC command parsing and host-volume expiry
   src/motor.rs              detents, encoder CRC, alignment math
   src/protocol.rs           explicit packet encoding and link state
   src/volume.rs             step tracking and HID press/release sequencing
   src/usb.rs                composite USB and HID report descriptors
+crates/display-ui/          portable, allocation-free 284x76 volume renderer
+  examples/preview.rs      exact-renderer desktop image export
 crates/board-support/       USB, SPI and ESP-NOW adapters for ESP-IDF
   src/usb.rs                S3 HID/CDC adapter and TinyUSB callbacks
 firmware/knob/src/          encoder, motor driver, haptic task, main loop
 firmware/display/src/       Rust framebuffer/panel driver and main loop
-tools/xtask/                PC-side Rust build/upload command helper
+tools/xtask/                PC-side Rust build/upload and volume feedback helper
 T-Knob/                    ignored vendor hardware reference
 T-Display-Bar/             ignored vendor hardware reference
 backups/                   ignored recovery images and hardware logs
@@ -317,14 +347,96 @@ size-preserving binding for an unused CDC telephony type that otherwise triggers
 Rust E0588 with the pinned ESP-IDF bindings generator. Application logic stays in
 Rust; the native USB stack is Espressif/TinyUSB.
 
-Current-volume feedback and animated pixel art remain future features. The LCD
-continues to show link and knob telemetry; it does not estimate volume percentage.
+The LCD now shows a volume instrument instead of the telemetry console. Detailed
+radio and motor information remains in the CDC logs. Actual host volume is an
+optional enhancement described below; HID controls do not depend on it.
 
 After flashing, start with a low host volume and turn a few detents in each
 direction. Confirm desktop volume changes, then test unplug/replug, host
 suspend/resume, and knob restart for unexpected changes. Verify CDC commands
 and LCD sleep while turning. Repeat on Windows before treating cross-platform
 behavior as tested. Builds and portable checks do not replace these bench tests.
+
+## Volume display and optional host feedback
+
+![Volume display: level, mute, relative mode, and maximum](docs/volume-ui.png)
+
+The 284×76 screen uses large warm-white pixel numerals, an orange cursor on a
+24-segment ruler, and a brief direction indicator when a volume key is queued.
+Zero, mute, unknown level, missing USB, missing knob, and a knob fault have
+distinct presentations. A known level above 100% displays its percentage and
+`BOOST`; the ruler ends at 100%. Mute preserves the reported level with dimmed
+digits and an empty ruler. The palette and geometry are in `crates/display-ui`.
+
+There are two independent paths:
+
+```text
+knob -> ESP-NOW -> display -> standard USB HID keys -> computer volume
+computer default-output volume -> optional companion -> CDC -> display UI
+```
+
+The first path remains plug and play on Ubuntu and Windows. The keyboard's
+Consumer Control HID interface sends keys; it does not receive the OS mixer
+level. Without a companion, the screen shows `--`, `RELATIVE`, and direction
+feedback. It never estimates a percentage from key presses: other controls,
+different OS step sizes, and output-device changes would make that drift.
+
+The initial companion is a development command for Ubuntu/Linux with
+PipeWire/WirePlumber (`wpctl` must be installed):
+
+```sh
+# Flash the new display firmware first, and close its serial monitor.
+cargo display volume
+# One snapshot, useful for checking the connection:
+cargo display volume --once
+```
+
+The helper only reads the default output's volume/mute and sends snapshots. It
+does not change volume, route audio, or reset the display. It checks every
+100 ms, sends changes plus a one-second heartbeat, and reconnects automatically.
+`DISPLAY_MONITOR_PORT`, then `DISPLAY_PORT`, override the runtime port as with
+`cargo display monitor`. The helper and monitor use the same exclusive port;
+stop the helper with Ctrl+C before monitoring or flashing. Nothing is installed
+at login. `--once` exits after sending, so its reading expires after 2.5 seconds.
+
+USB disconnect/suspend clears feedback; stopping the helper or losing audio
+feedback returns the display to unknown. Reconnecting the helper restores the
+reading without changing the HID control path. Knob disconnects can still show
+the host's level alongside a `FINDING KNOB` warning.
+
+The intended packaged companion would use PipeWire on Ubuntu and Windows
+[Core Audio endpoint volume](https://learn.microsoft.com/en-us/windows/win32/api/endpointvolume/nn-endpointvolume-iaudioendpointvolume),
+with an optional start-at-login setting. The Windows adapter, installers, and
+login integration are not implemented yet. The current Linux helper uses
+[`wpctl get-volume`](https://pipewire.pages.freedesktop.org/wireplumber/man/wpctl.html)
+as a small first implementation; normal HID operation requires no companion.
+
+The CDC feedback contract is newline-delimited ASCII:
+
+```text
+VOL 64 0     # 64 percent, unmuted (send only "VOL 64 0\n", without the comment)
+VOL 64 1     # 64 percent, muted
+VOL ?        # volume is unknown
+```
+
+Percentages are whole numbers from 0 through 999; mute is exactly 0 or 1. LF and
+CRLF are accepted. The firmware parses whole lines in a 32-byte buffer and
+discards invalid/overlong lines. `d`, `b`, and `?` are also complete lines now,
+so a malformed feedback packet cannot accidentally trigger a button shortcut.
+Reading at most 64 bytes per loop prevents a chatty computer from starving HID.
+
+Rendering is independent of the panel driver: the same code generates these
+native-resolution PPM previews on the PC, without connecting hardware:
+
+```sh
+cargo run -p keyboard-display-ui --example preview -- target/volume-preview
+```
+
+The UI uses no allocation while drawing. A complete RGB565 frame is 43,168 bytes
+and takes about 8.6 ms on the 40 MHz SPI wire, before software overhead. The
+firmware sends only changed frames, at most 25 per second, processes HID before
+drawing, and stops drawing while the LCD sleeps. The panel's verified register
+sequence, pin routing, and landscape offset are unchanged.
 
 ## Validation and recovery
 
@@ -333,7 +445,7 @@ Run the portable checks with:
 ```sh
 cargo test
 cargo test -p xtask
-cargo clippy -p keyboard-core -p xtask -- -D warnings
+cargo clippy -p keyboard-core -p keyboard-display-ui -p xtask --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo knob build
 cargo display build
@@ -346,7 +458,26 @@ packet bytes, malformed packets, round trips, peer reboot and sequence wrap.
 Volume tests also cover baseline resets, count rollover, press/release pairing,
 USB backpressure, stale backlog, reversal, composite descriptors, and prompt
 rate-limited knob updates. Helper tests cover ROM/runtime port selection and
-runtime-monitor argument handling.
+runtime-monitor argument handling, exact USB device selection during handoff,
+busy ports, old firmware timeouts, and excluding the connected knob.
+
+On 2026-11-02, the volume UI and automatic USB handoff changes passed 24 core
+tests and 13 helper tests, portable/UI/helper Clippy with warnings denied,
+formatting, and both release firmware builds. Code review found no remaining
+actionable issues. The exact-renderer UI previews were visually checked.
+The initial manual installation succeeded. On Ubuntu, a subsequent
+`cargo display flash` completed the automatic runtime CDC → hardware Serial/JTAG
+→ upload → runtime CDC/HID cycle. The display returned with `USB READY LINK
+CONNECTED`, zero radio errors, and panel/backlight ON. The optional
+`cargo display volume --once`
+helper also read and sent the current host volume successfully. Physical screen
+appearance and Windows handoff remain unverified. Logs:
+
+- `backups/rust-initial-auto-flash-install-20261102.txt`
+- `backups/rust-auto-flash-cycle-20261102.txt`
+- `backups/rust-auto-flash-usb-enumeration-20261102.txt`
+- `backups/rust-auto-flash-runtime-20261102.txt`
+- `backups/rust-volume-feedback-once-20261102.txt`
 
 On 2026-10-29, the HID integration passed 20 core tests and 2 helper tests,
 portable/helper Clippy with warnings denied, formatting, and both release
@@ -412,7 +543,9 @@ Restoring writes the complete flash, including its previous partition table and
 stored data. Recovery backups are ignored by Git; preserve `backups/` separately.
 
 If a board does not enter download mode automatically, hold BOOT, tap RESET,
-release BOOT and retry. Flashing and monitoring use the same data cable.
+release BOOT and retry. Use the actual RESET button; USB reconnection does not
+reset a board that remains powered by its battery. Flashing and monitoring use
+the same data cable.
 
 ## References
 

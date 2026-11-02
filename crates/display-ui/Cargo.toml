@@ -1,0 +1,7 @@
+[package]
+name = "keyboard-display-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+embedded-graphics = "=0.8.1"
