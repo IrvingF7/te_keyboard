@@ -309,8 +309,9 @@ A successful SPI write confirms transmission, not a visible image on the LCD.
 ## Plug-and-play volume control
 
 Connect the display's USB port to the computer and power the knob. After encoder
-alignment and radio connection, positive knob steps generate **Volume Up** and
-negative steps generate **Volume Down**, one key press/release per step. These
+alignment and radio connection, positive knob steps generate **Volume Down** and
+negative steps generate **Volume Up**, one key press/release per step. This
+reversed mapping accommodates the knob being used upside down. These
 are standard USB HID Consumer Control events; no project-specific PC program is
 needed. Windows and the standard Ubuntu desktop handle them as multimedia
 keyboard volume keys. The desktop determines the volume increment and output

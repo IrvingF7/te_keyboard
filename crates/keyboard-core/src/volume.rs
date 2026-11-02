@@ -91,8 +91,9 @@ impl VolumeKeys {
             Some(0)
         } else {
             match self.pending.cmp(&0) {
-                std::cmp::Ordering::Greater => Some(VOLUME_UP),
-                std::cmp::Ordering::Less => Some(VOLUME_DOWN),
+                // The knob is mounted upside down, reversing the apparent turn.
+                std::cmp::Ordering::Greater => Some(VOLUME_DOWN),
+                std::cmp::Ordering::Less => Some(VOLUME_UP),
                 std::cmp::Ordering::Equal => None,
             }
         }
@@ -103,11 +104,11 @@ impl VolumeKeys {
         match report {
             0 => self.release_pending = false,
             VOLUME_UP => {
-                self.pending -= 1;
+                self.pending += 1;
                 self.release_pending = true;
             }
             VOLUME_DOWN => {
-                self.pending += 1;
+                self.pending -= 1;
                 self.release_pending = true;
             }
             _ => unreachable!("unexpected volume report"),
@@ -182,14 +183,14 @@ mod tests {
         keys.observe(7, 15, 10);
         for _ in 0..3 {
             // A busy endpoint must not consume or duplicate a step.
-            assert_eq!(keys.next_report(10), Some(VOLUME_UP));
-            assert_eq!(keys.next_report(10), Some(VOLUME_UP));
-            assert_eq!(send(&mut keys, 10), Some(VOLUME_UP));
+            assert_eq!(keys.next_report(10), Some(VOLUME_DOWN));
+            assert_eq!(keys.next_report(10), Some(VOLUME_DOWN));
+            assert_eq!(send(&mut keys, 10), Some(VOLUME_DOWN));
             assert_eq!(send(&mut keys, 10), Some(0));
         }
         assert_eq!(send(&mut keys, 10), None);
         keys.observe(7, 14, 20);
-        assert_eq!(send(&mut keys, 20), Some(VOLUME_DOWN));
+        assert_eq!(send(&mut keys, 20), Some(VOLUME_UP));
         assert_eq!(send(&mut keys, 20), Some(0));
         assert_eq!(send(&mut keys, 20), None);
     }
@@ -200,14 +201,14 @@ mod tests {
         keys.observe(7, 12, 0);
         send(&mut keys, 0);
         keys.observe(7, 15, 10);
-        assert_eq!(send(&mut keys, 10), Some(VOLUME_UP));
+        assert_eq!(send(&mut keys, 10), Some(VOLUME_DOWN));
         keys.reset();
         assert_eq!(send(&mut keys, 20), Some(0));
         keys.observe(7, 40, 30);
         assert_eq!(send(&mut keys, 30), Some(0));
         assert_eq!(send(&mut keys, 30), None);
         keys.observe(7, 42, 40);
-        assert_eq!(send(&mut keys, 40), Some(VOLUME_UP));
+        assert_eq!(send(&mut keys, 40), Some(VOLUME_DOWN));
         keys.observe(8, 0, 50);
         assert_eq!(send(&mut keys, 50), Some(0));
         assert_eq!(send(&mut keys, 50), None);
@@ -220,17 +221,17 @@ mod tests {
         send(&mut keys, u32::MAX - 100);
         keys.observe(7, 1000, u32::MAX - 100);
         for _ in 0..MAX_PENDING_STEPS {
-            assert_eq!(send(&mut keys, u32::MAX - 100), Some(VOLUME_UP));
+            assert_eq!(send(&mut keys, u32::MAX - 100), Some(VOLUME_DOWN));
             assert_eq!(send(&mut keys, u32::MAX - 100), Some(0));
         }
         assert_eq!(send(&mut keys, u32::MAX - 100), None);
         keys.observe(7, 1003, u32::MAX - 100);
-        assert_eq!(send(&mut keys, u32::MAX - 100), Some(VOLUME_UP));
+        assert_eq!(send(&mut keys, u32::MAX - 100), Some(VOLUME_DOWN));
         assert_eq!(send(&mut keys, 399), Some(0));
         assert_eq!(send(&mut keys, 399), None);
         // Fresh movement after expiration must not revive the stale backlog.
         keys.observe(7, 1004, 400);
-        assert_eq!(send(&mut keys, 400), Some(VOLUME_UP));
+        assert_eq!(send(&mut keys, 400), Some(VOLUME_DOWN));
         assert_eq!(send(&mut keys, 400), Some(0));
         assert_eq!(send(&mut keys, 400), None);
     }
@@ -242,7 +243,7 @@ mod tests {
         send(&mut keys, 0);
         keys.observe(7, 3, 10);
         keys.observe(7, -1, 20);
-        assert_eq!(send(&mut keys, 20), Some(VOLUME_DOWN));
+        assert_eq!(send(&mut keys, 20), Some(VOLUME_UP));
         assert_eq!(send(&mut keys, 20), Some(0));
         assert_eq!(send(&mut keys, 20), None);
     }
